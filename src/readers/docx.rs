@@ -1,20 +1,35 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
 use std::io::Read;
 
 use crate::ir::doc::{Block, DocIR, Inline};
 
+/// Cap on the decompressed size of `word/document.xml`.
+///
+/// A ZIP entry can compress a few kilobytes into gigabytes of output, so reading
+/// it unbounded lets a small crafted .docx exhaust memory and take the process
+/// down. Real documents are orders of magnitude below this.
+const MAX_DOCUMENT_XML: u64 = 64 * 1024 * 1024;
+
 pub fn parse(bytes: &[u8]) -> Result<DocIR> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("Not a valid DOCX (ZIP) file")?;
 
     let xml = {
-        let mut f = archive
+        let f = archive
             .by_name("word/document.xml")
             .context("Missing word/document.xml")?;
         let mut s = String::new();
-        f.read_to_string(&mut s)?;
+        // Read one byte past the limit so that hitting it is distinguishable
+        // from a document that happens to be exactly MAX_DOCUMENT_XML long.
+        f.take(MAX_DOCUMENT_XML + 1).read_to_string(&mut s)?;
+        if s.len() as u64 > MAX_DOCUMENT_XML {
+            bail!(
+                "word/document.xml exceeds the {} MiB decompression limit — refusing to parse.",
+                MAX_DOCUMENT_XML / (1024 * 1024)
+            );
+        }
         s
     };
 

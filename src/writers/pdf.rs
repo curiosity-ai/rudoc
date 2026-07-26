@@ -1,18 +1,82 @@
 //! PDF writer with two strategies:
-//!  1. Subprocess: call `typst` CLI if available on PATH (best quality)
+//!  1. Subprocess: call the `typst` CLI if it is on PATH (best quality)
 //!  2. Built-in:   `printpdf` with embedded Helvetica (feature = "pdf")
 //!  3. Fallback:   helpful error with instructions
+//!
+//! Strategy 1 executes an external program, so it is selectable via
+//! `--pdf-engine` and announces itself on stderr rather than running silently.
 
 use anyhow::{bail, Result};
+use std::path::{Path, PathBuf};
+
 use crate::ir::doc::DocIR;
 use crate::writers::typst_writer;
 
-pub fn render(doc: &DocIR, paper: &str, font: &str) -> Result<Vec<u8>> {
-    let typ_source = typst_writer::render(doc, paper, font);
+/// Which backend produces the PDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfEngine {
+    /// Use `typst` when it is available, otherwise the built-in renderer.
+    Auto,
+    /// Require the external `typst` binary; fail if it is missing.
+    Typst,
+    /// Never spawn a subprocess; use the built-in renderer only.
+    Builtin,
+}
 
+impl PdfEngine {
+    pub fn from_name(s: &str) -> Result<Self> {
+        Ok(match s.to_lowercase().as_str() {
+            "auto" => PdfEngine::Auto,
+            "typst" => PdfEngine::Typst,
+            "builtin" | "internal" | "printpdf" => PdfEngine::Builtin,
+            other => bail!(
+                "Unknown --pdf-engine '{}'. Valid values: auto, typst, builtin.",
+                other
+            ),
+        })
+    }
+}
+
+pub fn render(
+    doc: &DocIR,
+    paper: &str,
+    font: &str,
+    engine: PdfEngine,
+    quiet: bool,
+) -> Result<Vec<u8>> {
     // Strategy 1: typst CLI subprocess (zero extra binary size)
-    if let Some(bytes) = try_typst_subprocess(&typ_source) {
-        return Ok(bytes);
+    if engine != PdfEngine::Builtin {
+        let required = engine == PdfEngine::Typst;
+        match find_typst() {
+            None if required => bail!(
+                "--pdf-engine=typst was requested, but no `typst` binary was found on PATH.\n\
+                 Install it from https://typst.app, or use --pdf-engine=builtin."
+            ),
+            None => {}
+            Some(program) => {
+                let typ_source = typst_writer::render(doc, paper, font);
+                match run_typst(&program, &typ_source, quiet) {
+                    Ok(Some(bytes)) => return Ok(bytes),
+                    Ok(None) if required => bail!(
+                        "`typst` at {} did not produce a PDF for the generated document.",
+                        program.display()
+                    ),
+                    Err(e) if required => return Err(e),
+                    Ok(None) => {
+                        if !quiet {
+                            eprintln!("[rudoc] warning: typst produced no output; \
+                                       falling back to the built-in renderer");
+                        }
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!("[rudoc] warning: typst engine error ({e}); \
+                                       falling back to the built-in renderer");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Strategy 2: built-in printpdf (requires feature = "pdf")
@@ -31,41 +95,156 @@ pub fn render(doc: &DocIR, paper: &str, font: &str) -> Result<Vec<u8>> {
     )
 }
 
-/// Try to call the `typst` CLI using properly unique temp file paths.
-fn try_typst_subprocess(typ_source: &str) -> Option<Vec<u8>> {
-    // Use a thread-local counter + pid for guaranteed-unique names
-    // without any external dependency.
-    let id = unique_id();
-    let tmp_dir  = std::env::temp_dir();
-    let typ_path = tmp_dir.join(format!("rudoc_{}_{}.typ", std::process::id(), id));
-    let pdf_path = tmp_dir.join(format!("rudoc_{}_{}.pdf", std::process::id(), id));
-
-    std::fs::write(&typ_path, typ_source).ok()?;
-
-    let status = std::process::Command::new("typst")
-        .args(["compile", typ_path.to_str()?, pdf_path.to_str()?])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .ok()?;
-
-    let _ = std::fs::remove_file(&typ_path);
-
-    if !status.success() {
-        let _ = std::fs::remove_file(&pdf_path);
-        return None;
-    }
-
-    let bytes = std::fs::read(&pdf_path).ok()?;
-    let _ = std::fs::remove_file(&pdf_path);
-    Some(bytes)
+/// Compile `typ_source` with an already-resolved `typst` binary.
+///
+/// `Ok(None)` means typst ran but produced no PDF; the caller decides whether
+/// that is fatal.
+fn run_typst(program: &Path, typ_source: &str, quiet: bool) -> Result<Option<Vec<u8>>> {
+    let dir = create_private_dir()?;
+    let result = compile_in(&dir, program, typ_source, quiet);
+    // Clean up whatever happened, including on the error paths.
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
-/// Monotonically increasing counter, unique within this process.
-fn unique_id() -> u64 {
+fn compile_in(
+    dir: &Path,
+    program: &Path,
+    typ_source: &str,
+    quiet: bool,
+) -> Result<Option<Vec<u8>>> {
+    let typ_path = dir.join("input.typ");
+    let pdf_path = dir.join("output.pdf");
+
+    std::fs::write(&typ_path, typ_source)?;
+
+    if !quiet {
+        eprintln!("[rudoc] PDF via external engine: {}", program.display());
+    }
+
+    // `--root` pins typst's file-access sandbox to our private directory, so a
+    // converted document cannot reach files elsewhere on the machine even if it
+    // manages to get something evaluated.
+    let status = std::process::Command::new(program)
+        .arg("compile")
+        .arg("--root")
+        .arg(dir)
+        .arg(&typ_path)
+        .arg(&pdf_path)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()?;
+
+    if !status.success() {
+        return Ok(None);
+    }
+    Ok(std::fs::read(&pdf_path).ok())
+}
+
+/// Create a private, exclusively-owned scratch directory under the system temp
+/// directory, and return its path.
+///
+/// Writing `rudoc_<pid>_<n>.typ` directly into the shared temp directory is not
+/// safe: the names are predictable and `fs::write` follows symlinks, so a local
+/// attacker can pre-create the path as a link to a file they want truncated and
+/// overwritten — and can swap the output PDF between typst writing it and rudoc
+/// reading it back, making rudoc emit a file of their choosing.
+///
+/// `mkdir(2)` fails when the final component already exists and does not follow
+/// a symlink there, which makes directory creation the atomic step that defeats
+/// both races. On Unix the directory is created 0700 so nothing can be planted
+/// inside it afterwards.
+fn create_private_dir() -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+
+    for attempt in 0..64u32 {
+        let path = base.join(format!(
+            "rudoc-{}-{:016x}",
+            std::process::id(),
+            scratch_token(attempt)
+        ));
+
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    bail!("Could not create a private temporary directory in {}", base.display())
+}
+
+/// Name material for the scratch directory. Not cryptographic — it only has to
+/// avoid collisions; `mkdir` failing on an existing path is what provides the
+/// security property.
+fn scratch_token(attempt: u32) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     static CTR: AtomicU64 = AtomicU64::new(0);
-    CTR.fetch_add(1, Ordering::Relaxed)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    nanos
+        ^ (CTR.fetch_add(1, Ordering::Relaxed) << 32)
+        ^ ((attempt as u64) << 48)
+}
+
+/// Locate the `typst` binary by walking PATH ourselves.
+///
+/// `Command::new("typst")` hands resolution to the platform, and on Windows the
+/// process-creation search order includes the current directory — so converting
+/// documents inside an untrusted folder could execute a `typst.exe` dropped
+/// alongside them. Resolving to an absolute path here keeps the lookup to
+/// absolute PATH entries. Only `.exe` is considered on Windows, which avoids the
+/// separate argument-escaping hazards of `.bat`/`.cmd` wrappers.
+fn find_typst() -> Option<PathBuf> {
+    find_typst_in(&std::env::var_os("PATH")?)
+}
+
+fn find_typst_in(path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "typst.exe" } else { "typst" };
+
+    for dir in std::env::split_paths(path_var) {
+        // An empty PATH entry means "current directory" on POSIX; skip it, and
+        // skip any other relative entry, for the same reason.
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Pure-Rust PDF using printpdf with Helvetica built-in font.
@@ -206,4 +385,65 @@ fn word_wrap(text: &str, chars_per_line: usize) -> Vec<String> {
     if !current.is_empty() { lines.push(current); }
     if lines.is_empty() { lines.push(String::new()); }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_names_parse() {
+        assert_eq!(PdfEngine::from_name("auto").unwrap(), PdfEngine::Auto);
+        assert_eq!(PdfEngine::from_name("TYPST").unwrap(), PdfEngine::Typst);
+        assert_eq!(PdfEngine::from_name("builtin").unwrap(), PdfEngine::Builtin);
+        assert!(PdfEngine::from_name("latex").is_err());
+    }
+
+    #[test]
+    fn scratch_dir_is_private_unique_and_removable() {
+        let a = create_private_dir().unwrap();
+        let b = create_private_dir().unwrap();
+        assert_ne!(a, b, "scratch directory names must not collide");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "scratch dir must not be group/world accessible");
+        }
+
+        // Re-creating an existing path must fail rather than reuse it, which is
+        // what stops a pre-planted symlink from being followed.
+        let mut builder = std::fs::DirBuilder::new();
+        assert!(builder.recursive(false).create(&a).is_err());
+
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn typst_lookup_ignores_relative_path_entries() {
+        use std::ffi::OsStr;
+
+        // "." and the empty entry are what would let a binary dropped in the
+        // working directory be executed. Neither may be searched, even when a
+        // real `typst` sits right there.
+        let dir = create_private_dir().unwrap();
+        let planted = dir.join(if cfg!(windows) { "typst.exe" } else { "typst" });
+        std::fs::write(&planted, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(find_typst_in(OsStr::new(".:")).is_none());
+        assert!(find_typst_in(OsStr::new("")).is_none());
+        assert!(find_typst_in(OsStr::new("relative/dir")).is_none());
+
+        // An absolute entry pointing at the same binary is still honoured.
+        assert_eq!(find_typst_in(dir.as_os_str()).as_deref(), Some(planted.as_path()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

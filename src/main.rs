@@ -41,6 +41,8 @@ fn run() -> Result<()> {
         sheet_name:  cli.sheet.clone(),
         pdf_paper:   cli.pdf_paper.clone(),
         pdf_font:    cli.pdf_font.clone(),
+        pdf_engine:  writers::pdf::PdfEngine::from_name(&cli.pdf_engine)?,
+        allow_raw_html: cli.unsafe_raw_html,
         wrap:        cli.wrap,
         verbose:     cli.verbose,
         quiet:       cli.quiet,

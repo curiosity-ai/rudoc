@@ -2,8 +2,8 @@
 //! Writes directly to an in-memory buffer — no temp files.
 use anyhow::Result;
 use docx_rs::*;
-use std::io::Cursor;
-use std::path::Path;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 
 use crate::ir::doc::{Block, DocIR, Inline};
 
@@ -175,7 +175,7 @@ fn add_inline_to_para(para: Paragraph, il: &Inline) -> Paragraph {
             for i in alt { crate::ir::doc::inline_to_text(i, &mut alt_text); }
 
             if let Some(pic_data) = try_embed_image(src) {
-                let (w_emu, h_emu) = read_image_dims(src).unwrap_or((2743200, 1828800));
+                let (w_emu, h_emu) = read_image_dims(&pic_data).unwrap_or((2743200, 1828800));
                 let pic = Pic::new(&pic_data).size(w_emu, h_emu);
                 para.add_run(Run::new().add_image(pic))
             } else {
@@ -188,19 +188,87 @@ fn add_inline_to_para(para: Paragraph, il: &Inline) -> Paragraph {
     }
 }
 
-fn try_embed_image(src: &str) -> Option<Vec<u8>> {
+/// Largest image we are willing to read off disk and embed.
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Resolve an image reference from document content into a path we are willing
+/// to read.
+///
+/// Image sources come from the document being converted, which is routinely
+/// untrusted. Reading whatever path it names turns a format conversion into
+/// file exfiltration: `![](/etc/passwd)` or `![](../../.ssh/id_rsa)` would be
+/// read and embedded into the output `.docx` for the attacker to collect.
+/// References are therefore resolved relative to the current directory and must
+/// stay within it.
+fn resolve_image_path(src: &str) -> Option<PathBuf> {
     if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
         return None;
     }
     let path = Path::new(src);
-    if path.exists() { std::fs::read(path).ok() } else { None }
+    if path.is_absolute() {
+        return None;
+    }
+    let base = std::env::current_dir().ok()?.canonicalize().ok()?;
+    // canonicalize() resolves both ".." and symlinks, so neither can be used to
+    // walk out of `base` behind the containment check.
+    let resolved = base.join(path).canonicalize().ok()?;
+    if !resolved.starts_with(&base) || !resolved.is_file() {
+        return None;
+    }
+    Some(resolved)
 }
 
-fn read_image_dims(src: &str) -> Option<(u32, u32)> {
-    let path = Path::new(src);
-    if !path.exists() { return None; }
-    let reader = image::io::Reader::open(path).ok()?;
-    let reader = reader.with_guessed_format().ok()?;
+fn try_embed_image(src: &str) -> Option<Vec<u8>> {
+    let path = resolve_image_path(src)?;
+
+    // Read through a single handle rather than checking then re-opening, so the
+    // file cannot be swapped between the check and the read.
+    let file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 || len > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut data = Vec::with_capacity(len as usize);
+    file.take(MAX_IMAGE_BYTES).read_to_end(&mut data).ok()?;
+
+    validate_image(&data)?;
+
+    Some(data)
+}
+
+/// Largest edge length and decoded footprint we are willing to process.
+const MAX_IMAGE_DIMENSION: u32 = 20_000;
+const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Confirm the bytes really decode as a supported image.
+///
+/// Two separate problems need this. Sniffing the magic number is not enough for
+/// confidentiality — a file that merely *starts* with a PNG signature is not an
+/// image, and embedding it would still hand over its contents. It is also not
+/// enough for robustness: docx-rs decodes the buffer with an `expect`, so any
+/// malformed input reaching `Pic::new` aborts the whole conversion. Decoding
+/// here, against the same `image` version docx-rs uses, rules out both — and the
+/// limits stop a small file that declares enormous dimensions from being
+/// expanded into gigabytes of pixels.
+fn validate_image(data: &[u8]) -> Option<()> {
+    let mut limits = image::io::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+
+    let mut reader = image::io::Reader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    reader.format()?;
+    reader.decode().ok()?;
+    Some(())
+}
+
+fn read_image_dims(data: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::io::Reader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
     let (w_px, h_px) = reader.into_dimensions().ok()?;
     let w_emu = w_px * 9525;
     let h_emu = h_px * 9525;
@@ -210,5 +278,40 @@ fn read_image_dims(src: &str) -> Option<(u32, u32)> {
         Some((max_w, (h_emu as f64 * scale) as u32))
     } else {
         Some((w_emu, h_emu))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_and_traversing_paths_are_refused() {
+        for hostile in [
+            "/etc/passwd",
+            "../../../../etc/passwd",
+            "../Cargo.toml",
+            "http://example.com/x.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert!(resolve_image_path(hostile).is_none(), "should be refused: {hostile}");
+        }
+    }
+
+    #[test]
+    fn paths_inside_the_working_directory_resolve() {
+        // Tests run with the crate root as the working directory.
+        assert!(resolve_image_path("Cargo.toml").is_some());
+        assert!(resolve_image_path("does-not-exist.png").is_none());
+    }
+
+    #[test]
+    fn non_images_are_not_embedded() {
+        // Right magic number, invalid body: must be rejected rather than
+        // embedded, and rather than reaching docx-rs, which would panic.
+        let mut fake_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        fake_png.extend_from_slice(b"SECRET-CONTENT");
+        assert!(validate_image(&fake_png).is_none());
+        assert!(validate_image(b"plain text, not an image").is_none());
     }
 }

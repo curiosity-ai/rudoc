@@ -1,6 +1,9 @@
 # Rudoc
 
-**Fast, dependency-free document converter** — a focused Rust replacement for Pandoc.
+**Fast, single-binary document converter** — a focused Rust replacement for Pandoc.
+
+No runtime dependencies for any conversion except PDF, which optionally uses the
+`typst` CLI when it is installed (see [PDF Output](#pdf-output)).
 
 [![Release](https://img.shields.io/github/v/release/asong56/rudoc)](https://github.com/asong56/rudoc/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -144,6 +147,8 @@ OPTIONS:
       --sheet <NAME>       Sheet name for XLSX output/input [default: Sheet1]
       --pdf-paper <SIZE>   Paper: a4 a3 a5 us-letter us-legal [default: a4]
       --pdf-font <NAME>    Body font for Typst/PDF output [default: Arial]
+      --pdf-engine <NAME>  auto | typst | builtin [default: auto]
+      --unsafe-raw-html    Pass raw HTML from the input into HTML output
       --wrap <COLS>        Line-wrap width for md/txt output (0 = off)
   -q, --quiet              Suppress progress messages
   -v, --verbose            Show IR stats and timing
@@ -186,6 +191,38 @@ To get the highest-quality PDFs:
 # Install typst, then:
 rudoc document.md -o document.pdf
 ```
+
+Strategy 1 runs an external program. Rudoc reports it on stderr when it does,
+resolves `typst` only from absolute `PATH` entries, and compiles inside a
+private `0700` scratch directory that it passes as typst's `--root`. Pass
+`--pdf-engine=builtin` to keep everything in-process, or `--pdf-engine=typst`
+to fail rather than silently fall back.
+
+---
+
+## Converting Untrusted Documents
+
+Input documents are data, not instructions. When converting files you did not
+write, the defaults are the safe ones:
+
+- **Raw HTML is escaped, not passed through.** A `<script>` in a Markdown file
+  becomes visible text in the HTML output rather than executing in whoever opens
+  it. Use `--unsafe-raw-html` to restore passthrough for input you trust.
+- **Link and image URLs are scheme-filtered.** `javascript:`, `vbscript:` and
+  `data:` payloads are replaced with `#`; `http(s)`, `mailto`, `ftp(s)`, `tel`,
+  relative URLs and `data:image/*` are kept.
+- **Images are read only from within the working directory**, and only if the
+  bytes actually decode as an image. A document cannot make the converter read
+  `/etc/passwd` and embed it in the output.
+- **Text cells that would be read as spreadsheet formulas are prefixed with
+  `'`** in CSV output, so opening the result in Excel does not execute them.
+  Numeric cells are untouched.
+- **Archive inputs are size-capped** — `.docx`/`.xlsx` that declare implausible
+  decompressed sizes are rejected instead of exhausting memory.
+
+Two limits worth knowing: the image path restriction means absolute paths in a
+document are not embedded, and the archive check reads sizes the archive itself
+declares, so running bulk conversions under a memory limit is still wise.
 
 ---
 

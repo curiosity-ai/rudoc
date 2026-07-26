@@ -4,6 +4,8 @@ use crate::detect::{Format, IrTier};
 use crate::error::RudocError;
 use crate::ir::doc::DocIR;
 use crate::ir::slide::SlideIR;
+use crate::writers::html::HtmlOptions;
+use crate::writers::pdf::PdfEngine;
 use crate::{readers, writers};
 
 /// All user-facing options that affect conversion.
@@ -16,6 +18,9 @@ pub struct ConvertOptions {
     pub sheet_name: String,
     pub pdf_paper: String,
     pub pdf_font: String,
+    pub pdf_engine: PdfEngine,
+    /// Pass raw HTML from the source through to HTML output verbatim.
+    pub allow_raw_html: bool,
     pub wrap: Option<usize>,
     pub verbose: bool,
     pub quiet: bool,
@@ -31,6 +36,8 @@ impl Default for ConvertOptions {
             sheet_name: "Sheet1".to_string(),
             pdf_paper: "a4".to_string(),
             pdf_font: "Arial".to_string(),
+            pdf_engine: PdfEngine::Auto,
+            allow_raw_html: false,
             wrap: None,
             verbose: false,
             quiet: false,
@@ -144,7 +151,10 @@ fn convert_doc_ir(doc: DocIR, to: Format, opts: &ConvertOptions) -> Result<Vec<u
             Ok(s.into_bytes())
         }
         Format::Html => {
-            let s = writers::html::render(&doc, opts.standalone);
+            let s = writers::html::render(&doc, HtmlOptions {
+                standalone: opts.standalone,
+                allow_raw_html: opts.allow_raw_html,
+            });
             Ok(s.into_bytes())
         }
         Format::Txt => {
@@ -156,7 +166,9 @@ fn convert_doc_ir(doc: DocIR, to: Format, opts: &ConvertOptions) -> Result<Vec<u
             let s = writers::typst_writer::render(&doc, &opts.pdf_paper, &opts.pdf_font);
             Ok(s.into_bytes())
         }
-        Format::Pdf => writers::pdf::render(&doc, &opts.pdf_paper, &opts.pdf_font),
+        Format::Pdf => writers::pdf::render(
+            &doc, &opts.pdf_paper, &opts.pdf_font, opts.pdf_engine, opts.quiet,
+        ),
         _ => bail!("Unexpected format in doc tier: {}", to),
     }
 }

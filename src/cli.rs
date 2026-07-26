@@ -6,8 +6,11 @@ use clap::{ArgAction, Parser};
     version = env!("CARGO_PKG_VERSION"),
     about = "Fast document converter — Pandoc's focused Rust replacement",
     long_about = "\
-Convert documents between formats with zero external dependencies.\n\
+Convert documents between formats.\n\
 Format is auto-detected from file extensions; use -f/-t to override.\n\
+\n\
+PDF output will use the `typst` binary when it is installed; pass\n\
+--pdf-engine=builtin to keep everything in-process.\n\
 \n\
 SUPPORTED FORMATS\n\
   Document:    md  html  txt  docx  typ  pdf\n\
@@ -63,6 +66,19 @@ pub struct Cli {
     /// Body font for PDF/Typst output [default: Arial].
     #[arg(long, value_name = "NAME", default_value = "Arial")]
     pub pdf_font: String,
+
+    /// PDF backend: auto (use typst if installed), typst (require it), or
+    /// builtin (never run an external program) [default: auto].
+    #[arg(long, value_name = "ENGINE", default_value = "auto")]
+    pub pdf_engine: String,
+
+    /// Pass raw HTML from the input through to HTML output verbatim.
+    ///
+    /// Off by default. Raw passthrough means a <script> tag in the source
+    /// document executes in whoever opens the output, so enable this only for
+    /// input you trust.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub unsafe_raw_html: bool,
 
     /// Line-wrap width for txt output (0 = no wrapping).
     #[arg(long, value_name = "COLS")]
